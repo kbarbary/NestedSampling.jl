@@ -8,6 +8,7 @@ immutable Ellipsoid
     vol::Float64
 end
 
+# Calculate log(exp(x) + exp(y)).
 # surprised this isn't in Julia base 
 function logaddexp(x::FloatingPoint, y::FloatingPoint)
     if x == y
@@ -67,7 +68,7 @@ function bounding_ellipsoid(x::Matrix{Float64}, enlarge=1.0)
 
     ndim, npoints = size(x)
 
-    ctr = mean(x, 2)
+    ctr = mean(x, 2)[:, 1]
     delta = x .- ctr
     cov = Base.unscaled_covzm(delta, 2)
     icov = inv(cov)
@@ -93,11 +94,11 @@ function bounding_ellipsoid(x::Matrix{Float64}, enlarge=1.0)
     return Ellipsoid(ctr, cov, icov, vol)
 end
 
-function sample_ellipsoid(ell::Ellipsoid, nsamples=1)
-    ndim = length(ellipsoid.ctr)
+function sample_ellipsoid(ell::Ellipsoid)
+    ndim = length(ell.ctr)
 
     # Get scaled eigenvectors (in columns): vs[:,i] is the i-th eigenvector.
-    f = eigfact(ellipsoid.cov)
+    f = eigfact(ell.cov)
     v, w = f[:vectors], f[:values]
     for j=1:ndim
         tmp = sqrt(w[j])
@@ -106,13 +107,13 @@ function sample_ellipsoid(ell::Ellipsoid, nsamples=1)
         end
     end
 
-    return dot(v, randnball(ndim)) .+ ellipsoid.ctr
+    return v*randnball(ndim) + ell.ctr
 end
 
 
 # nested sampling algorithm to evaluate Bayesian evidence.
 function sample(loglikelihood::Function, prior::Function, ndim::Int;
-                npoints::Int=100, enlarge::Float=1.5, maxiter::Int=10000)
+                npoints::Int=100, enlarge::Float64=1.5, maxiter::Int=10000)
 
     # enlarge is volume enlargement factor
     enlarge_linear = enlarge^(1./ndim)
@@ -148,30 +149,34 @@ function sample(loglikelihood::Function, prior::Function, ndim::Int;
     while niter < maxiter
         niter += 1
 
+        if logz > -1.e6
+            @printf "\riter=%6d logz=%8f" niter logz
+        else
+            @printf "\riter=%6d logz=" niter
+        end
+        flush(STDOUT)
+
         # find lowest logl in active points
-        logl, minidx = findmin(points_logl)
-        logwt = logwidth + logl
+        loglstar, minidx = findmin(points_logl)
+        logwt = logwidth + loglstar
 
         # update evidence and information
         logz_new = logaddexp(logz, logwt)
-        h = (exp(logwt-logz_new) * logl +
+        h = (exp(logwt-logz_new) * loglstar +
              exp(logz-logz_new) * (h+logz) - logz_new)
         logz = logz_new
 
         # Add worst object to samples.
-        append!(samples_v, sub(v, :, minidx))
+        append!(samples_v, sub(points_v, :, minidx))
         push!(samples_logwt, logwt)
         push!(samples_logprior, logwidth)
-        push!(samples_logl, logl)
-
-        # The new likelihood constraint is that of the worst object.
-        loglstar = logl
+        push!(samples_logl, loglstar)
 
         expected_vol = exp(-niter/npoints)
 
         # calculate the ellipsoid in prior space that contains all the
         # samples (including the worst one).
-        ellip = bounding_ellipsoid(points_u, enlarge_linear)
+        ell = bounding_ellipsoid(points_u, enlarge_linear)
 
         # choose a point from within the ellipse until it has likelihood
         # better than loglstar
@@ -186,21 +191,23 @@ function sample(loglikelihood::Function, prior::Function, ndim::Int;
             ncall += 1
 
             # Accept if and only if within likelihood constraint.
-            if logl > loglstar:
+            if logltmp > loglstar
                 points_u[:, minidx] = u
                 points_v[:, minidx] = v
-                points_logl[minidx] = logl
+                points_logl[minidx] = logltmp
                 break
             end
         end
 
         # Shrink interval
-        logwidth -= 1./nobj
+        logwidth -= 1./npoints
 
-        # stop when the logwt has been declining for more than nobj* 2
-        # or niter/4 consecutive iterations.
+        # stop when logwt has been declining for more than 2*npoints
+        # or niter/6 consecutive iterations.
         ndecl = (logwt < logwt_old) ? ndecl+1 : 0
-        (ndecl > 2*npoints) && (ndecl > niter/6) && break
+        if (ndecl > 2*npoints) && (ndecl > niter/6)
+            break
+        end
         logwt_old = logwt
     end
 
@@ -230,7 +237,7 @@ function sample(loglikelihood::Function, prior::Function, ndim::Int;
             "ncall" => ncall,
             "logz" => logz,
             "logzerr" => sqrt(h/npoints),
-            "loglmax" => max(points_logl),
+            "loglmax" => maximum(points_logl),
             "h" => h,
             "samples" => reshape(samples_v, (nsamples, ndim)),
             "weights" => exp(samples_logwt .- logz),
